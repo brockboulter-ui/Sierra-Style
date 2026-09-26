@@ -8,7 +8,7 @@ exports.handler = async (event) => {
   try {
     const { id } = JSON.parse(event.body || "{}");
     if (!id) return { statusCode: 400, body: "Missing id" };
-    const store = getStore({ name: "submissions", consistency: "strong" });
+    const store = getStore("submissions");
     await store.delete(id);
     return { statusCode: 200, body: JSON.stringify({ ok: true }) };
   } catch (e) {

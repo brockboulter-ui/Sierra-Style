@@ -9,7 +9,7 @@ exports.handler = async (event) => {
   try {
     const data = JSON.parse(event.body || "{}");
     const id = crypto.randomUUID();
-    const store = getStore({ name: "submissions", consistency: "strong" });
+    const store = getStore("submissions");
     await store.setJSON(id, {
       ...data,
       id,
