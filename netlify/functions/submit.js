@@ -1,7 +1,8 @@
-const { getStore } = require("@netlify/blobs");
+const { getStore, connectLambda } = require("@netlify/blobs");
 const crypto = require("node:crypto");
 
 exports.handler = async (event) => {
+  connectLambda(event);
   if (event.httpMethod !== "POST") {
     return { statusCode: 405, body: "Method not allowed" };
   }
