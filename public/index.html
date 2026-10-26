@@ -129,13 +129,6 @@ function daysInMonth(anchor) {
 }
 const sameDay = (a, b) => a && b && a.toDateString() === b.toDateString();
 
-// Stands in for real client-submitted availability once there's a shared
-// backend. For now it just demonstrates what the notification marker looks
-// like — a deterministic mock so certain days always show a pending badge.
-function mockPendingAvailability(date) {
-  const pattern = [0, 2, 0, 1, 0, 3, 0];
-  return pattern[date.getDate() % pattern.length];
-}
 const dayLabel = d => d.toLocaleDateString("en-US", {
   weekday: "short"
 });
@@ -148,63 +141,7 @@ const fullDateLabel = d => d.toLocaleDateString("en-US", {
   month: "long",
   day: "numeric"
 });
-function mockBookingsFor(date) {
-  const seed = date.getDate();
-  const pool = [{
-    client: "Maya Torres",
-    phone: "(555) 019-2231",
-    serviceIds: ["cut"],
-    start: "10:00",
-    duration: 45,
-    note: "",
-    originalWindow: "9:30 AM \u2013 12:00 PM",
-    notified: false,
-    confirmed: false
-  }, {
-    client: "Priya Shah",
-    phone: "(555) 402-8817",
-    serviceIds: ["color"],
-    start: "11:00",
-    duration: 120,
-    note: "Also wondering if you do balayage \u2014 didn't see it on the list!",
-    originalWindow: "10:00 AM \u2013 2:00 PM",
-    notified: true,
-    confirmed: false
-  }, {
-    client: "Dana Wu",
-    phone: "(555) 771-0043",
-    serviceIds: ["facial"],
-    start: "14:00",
-    duration: 60,
-    note: "",
-    originalWindow: "1:00 PM \u2013 4:00 PM",
-    notified: true,
-    confirmed: true
-  }, {
-    client: "Sofia Reyes",
-    phone: "(555) 335-6690",
-    serviceIds: ["cut", "facial"],
-    start: "15:30",
-    duration: 45,
-    note: "Flexible \u2014 could also do any time Thursday if that's easier.",
-    originalWindow: "3:00 PM \u2013 5:30 PM",
-    notified: false,
-    confirmed: false
-  }];
-  return pool.filter((_, i) => (seed + i) % 3 !== 0).map((b, i) => ({
-    id: `${seed}-${i}`,
-    type: "booking",
-    client: b.client,
-    phone: b.phone,
-    serviceIds: b.serviceIds,
-    start: b.start,
-    end: fromMinutes(toMinutes(b.start) + b.duration),
-    note: b.note,
-    originalWindow: b.originalWindow,
-    notified: b.notified,
-    confirmed: b.confirmed
-  }));
-}
+
 function toMinutes(hhmm) {
   const [h, m] = hhmm.split(":").map(Number);
   return h * 60 + m;
@@ -318,17 +255,7 @@ const HOURS = WEEKDAYS.map((d, i) => ({
 // or other clients' submitted availability — should restrict a client's
 // selection, so this is the one thing that disables ticks here.
 function mockBlockedFor(date) {
-  const blocks = [{
-    start: "12:00",
-    end: "12:30",
-    reason: "Lunch"
-  }];
-  if (date.getDate() % 4 === 0) blocks.push({
-    start: "09:00",
-    end: "10:00",
-    reason: "Staff meeting"
-  });
-  return blocks;
+  return [];
 }
 
 // Convention: a selected window means the client is free start-to-finish
@@ -1984,10 +1911,10 @@ function AdminAppInner() {
   }, [viewMonth, today]);
   const [itemsByDay, setItemsByDay] = useState({});
   const dayKey = selectedDate.toDateString();
-  const items = itemsByDay[dayKey] || mockBookingsFor(selectedDate);
+  const items = itemsByDay[dayKey] || [];
   const setItemsForDay = updater => {
     setItemsByDay(prev => {
-      const current = prev[dayKey] || mockBookingsFor(selectedDate);
+      const current = prev[dayKey] || [];
       const next = typeof updater === "function" ? updater(current) : updater;
       return {
         ...prev,
@@ -2129,23 +2056,7 @@ function AdminAppInner() {
   // A running list of clients Sierra has entered, so their name and phone
   // autofill next time instead of being retyped. Also the same roster a
   // future mass-text recipient picker would draw from.
-  const [clients, setClients] = useState([{
-    id: "maya",
-    name: "Maya Torres",
-    phone: "(555) 019-2231"
-  }, {
-    id: "priya",
-    name: "Priya Shah",
-    phone: "(555) 402-8817"
-  }, {
-    id: "dana",
-    name: "Dana Wu",
-    phone: "(555) 771-0043"
-  }, {
-    id: "sofia",
-    name: "Sofia Reyes",
-    phone: "(555) 335-6690"
-  }]);
+  const [clients, setClients] = useState([]);
   const [showClientSuggestions, setShowClientSuggestions] = useState(false);
   const clientMatches = useMemo(() => {
     const q = bookingForm.client.trim().toLowerCase();
@@ -2679,7 +2590,7 @@ function AdminAppInner() {
     const isSelected = sameDay(d, selectedDate);
     const isToday = sameDay(d, today);
     const released = isReleasedFor(d);
-    const pending = mockPendingAvailability(d);
+    const pending = submissions.filter(s => s.dateKey === d.toDateString()).length;
     return /*#__PURE__*/React.createElement("div", {
       key: i,
       style: aStyles.dayPillWrap
@@ -3383,23 +3294,28 @@ function App() {
     onUnlock: () => setMode("admin"),
     onBack: () => setMode("client")
   });
-  return React.createElement(React.Fragment, null, React.createElement(ClientAppInner), React.createElement("button", {
+  return React.createElement(React.Fragment, null, React.createElement(ClientAppInner), React.createElement("div", {
+    style: {
+      display: "flex",
+      justifyContent: "flex-start",
+      padding: "4px 16px 16px",
+      background: "#FAF6F2"
+    }
+  }, React.createElement("button", {
     onClick: () => setMode("pin"),
     style: {
-      position: "fixed",
-      bottom: 8,
-      right: 12,
       background: "none",
       border: "none",
-      color: "#D9CFC9",
+      color: "#CFC4BD",
       fontSize: 11,
       cursor: "pointer",
-      zIndex: 100
+      padding: "8px 4px"
     }
-  }, "Sierra"));
+  }, "Sierra")));
 }
 const root = ReactDOM.createRoot(document.getElementById("root"));
 root.render(React.createElement(App));
+
 </script>
 </body>
 </html>
