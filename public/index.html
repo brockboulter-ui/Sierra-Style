@@ -227,36 +227,25 @@ function layoutOverlaps(bookings) {
   });
   return layout;
 }
-const SERVICES = [{
-  id: "cut",
-  name: "Haircut & Style",
-  price: "$65",
-  icon: Scissors
-}, {
-  id: "color",
-  name: "Full Color",
-  price: "$150",
-  icon: Droplet
-}, {
-  id: "facial",
-  name: "Signature Facial",
-  price: "$95",
-  icon: Sparkles
-}];
-const HOURS = WEEKDAYS.map((d, i) => ({
-  day: d,
-  closed: i === 0,
-  start: "09:00",
-  end: "17:00"
-}));
-
-// Stands in for a real owner-created block (like the admin "Block" button)
-// once there's a shared backend. Only blocks — never confirmed appointments
-// or other clients' submitted availability — should restrict a client's
-// selection, so this is the one thing that disables ticks here.
-function mockBlockedFor(date) {
-  return [];
-}
+const ICON_FOR = {
+  cut: Scissors,
+  color: Droplet,
+  facial: Sparkles
+};
+const DEFAULT_SHARED = {
+  services: INITIAL_SERVICES,
+  hours: DEFAULT_HOURS,
+  hourOverrides: {},
+  releasedDays: {},
+  blocksByDay: {}
+};
+const EMPTY_SHARED = {
+  services: [],
+  hours: DEFAULT_HOURS,
+  hourOverrides: {},
+  releasedDays: {},
+  blocksByDay: {}
+};
 
 // Convention: a selected window means the client is free start-to-finish
 // within it — an appointment placed in this window must be able to finish
@@ -1450,6 +1439,42 @@ function ClientAppInner() {
   const [sent, setSent] = useState(false);
   const [sendError, setSendError] = useState("");
   const [sending, setSending] = useState(false);
+
+  // Sierra's services, hours, open days and blocked times come from the server,
+  // so whatever she changes on her side shows up here.
+  const [shared, setShared] = useState(null);
+  const [sharedError, setSharedError] = useState(false);
+  const loadShared = async () => {
+    try {
+      const res = await fetch("/.netlify/functions/state", {
+        cache: "no-store"
+      });
+      if (!res.ok) throw new Error("bad response");
+      setShared(await res.json());
+      setSharedError(false);
+    } catch (e) {
+      setSharedError(true);
+    }
+  };
+  useEffect(() => {
+    loadShared();
+    const interval = setInterval(loadShared, 60000);
+    const onVisible = () => {
+      if (document.visibilityState === "visible") loadShared();
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      clearInterval(interval);
+      document.removeEventListener("visibilitychange", onVisible);
+    };
+  }, []);
+  const cfg = shared ? shared.initialized ? shared : DEFAULT_SHARED : EMPTY_SHARED;
+  const services = useMemo(() => cfg.services.map(s => ({
+    ...s,
+    icon: ICON_FOR[s.id] || Sparkles
+  })), [cfg]);
+  const hoursFor = d => cfg.hourOverrides[d.toDateString()] || cfg.hours[d.getDay()];
+  const isOpenFor = d => !!cfg.releasedDays[d.toDateString()] && !hoursFor(d).closed;
   const stripRef = useRef(null);
   const today = useMemo(() => new Date(), []);
   const monthDays = useMemo(() => {
@@ -1459,8 +1484,8 @@ function ClientAppInner() {
     const startOfToday = new Date(today.getFullYear(), today.getMonth(), today.getDate());
     return all.filter(d => d >= startOfToday);
   }, [viewMonth, today]);
-  const selectedServices = SERVICES.filter(s => selectedServiceIds.includes(s.id));
-  const hoursForDay = selectedDate ? HOURS[selectedDate.getDay()] : null;
+  const selectedServices = services.filter(s => selectedServiceIds.includes(s.id));
+  const hoursForDay = selectedDate ? hoursFor(selectedDate) : null;
 
   // Every 15-min tick across the day. Only owner-created blocks disable a
   // tick — confirmed appointments and other clients' submitted availability
@@ -1469,10 +1494,10 @@ function ClientAppInner() {
     if (!selectedDate || !hoursForDay || hoursForDay.closed) return [];
     const dayStart = toMinutes(hoursForDay.start);
     const dayEnd = toMinutes(hoursForDay.end);
-    const blocked = mockBlockedFor(selectedDate).map(b => ({
+    const blocked = (cfg.blocksByDay[selectedDate.toDateString()] || []).map(b => ({
       start: toMinutes(b.start),
       end: toMinutes(b.end),
-      reason: b.reason
+      reason: ""
     }));
     const ticks = [];
     for (let t = dayStart; t < dayEnd; t += SLOT_MINUTES) {
@@ -1484,7 +1509,7 @@ function ClientAppInner() {
       });
     }
     return ticks;
-  }, [selectedDate, hoursForDay]);
+  }, [selectedDate, hoursForDay, cfg]);
   const openTicks = dayTicks.filter(t => !t.isBlocked);
   const blockedSet = useMemo(() => new Set(dayTicks.filter(t => t.isBlocked).map(t => t.start)), [dayTicks]);
   const allDaySelected = openTicks.length > 0 && openTicks.every(t => selectedTimes.has(t.start));
@@ -1580,7 +1605,7 @@ function ClientAppInner() {
             month: "long",
             day: "numeric"
           }),
-          serviceIds: selectedServiceIds,
+          serviceIds: selectedServices.map(s => s.id),
           serviceNames: selectedServices.map(s => s.name),
           ranges: selectedRanges.map(r => ({
             start: r.start,
@@ -1743,7 +1768,7 @@ function ClientAppInner() {
     style: cStyles.logoMark
   })), /*#__PURE__*/React.createElement("div", {
     style: cStyles.serviceRow
-  }, SERVICES.map(s => {
+  }, services.map(s => {
     const Icon = s.icon;
     const active = selectedServiceIds.includes(s.id);
     return /*#__PURE__*/React.createElement("button", {
@@ -1799,7 +1824,7 @@ function ClientAppInner() {
   }, monthDays.map((d, i) => {
     const isSelected = sameDay(d, selectedDate);
     const isPast = d < new Date(today.getFullYear(), today.getMonth(), today.getDate());
-    const isClosed = HOURS[d.getDay()].closed;
+    const isClosed = !isOpenFor(d);
     return /*#__PURE__*/React.createElement("button", {
       key: i,
       disabled: isPast || isClosed,
@@ -1817,7 +1842,11 @@ function ClientAppInner() {
     }, dayLabel(d)), /*#__PURE__*/React.createElement("span", {
       style: cStyles.dayNumber
     }, dateLabel(d)));
-  })), selectedDate && hoursForDay?.closed && /*#__PURE__*/React.createElement("p", {
+  })), !shared && /*#__PURE__*/React.createElement("p", {
+    style: cStyles.emptyNote
+  }, sharedError ? "Couldn't load Sierra's availability. Check your connection and try again in a moment." : "Loading\u2026"), shared && !monthDays.some(d => d >= new Date(today.getFullYear(), today.getMonth(), today.getDate()) && isOpenFor(d)) && /*#__PURE__*/React.createElement("p", {
+    style: cStyles.emptyNote
+  }, "Sierra hasn't opened any days for requests this month yet. Check back soon!"), selectedDate && hoursForDay?.closed && /*#__PURE__*/React.createElement("p", {
     style: cStyles.emptyNote
   }, "Closed this day."), selectedDate && !hoursForDay?.closed && /*#__PURE__*/React.createElement("div", {
     style: cStyles.slotSection
@@ -1891,7 +1920,10 @@ function ClientAppInner() {
     onClick: () => setReviewing(true)
   }, "Review & send")));
 }
-function AdminAppInner() {
+function AdminAppInner({
+  pin,
+  onAuthFail
+}) {
   const [tab, setTab] = useState("schedule");
   const [services, setServices] = useState(INITIAL_SERVICES);
   const [hours, setHours] = useState(DEFAULT_HOURS);
@@ -1997,7 +2029,11 @@ function AdminAppInner() {
   const [dbReady, setDbReady] = useState(true);
   const fetchSubmissions = async () => {
     try {
-      const res = await fetch("/.netlify/functions/submissions");
+      const res = await adminFetch("/.netlify/functions/submissions", pin);
+      if (res.status === 401) {
+        onAuthFail();
+        return;
+      }
       if (!res.ok) throw new Error("bad response");
       const items = await res.json();
       setSubmissions(items);
@@ -2014,11 +2050,8 @@ function AdminAppInner() {
   const dismissSubmission = async id => {
     setSubmissions(prev => prev.filter(s => s.id !== id));
     try {
-      await fetch("/.netlify/functions/dismiss", {
+      await adminFetch("/.netlify/functions/dismiss", pin, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json"
-        },
         body: JSON.stringify({
           id
         })
@@ -2057,6 +2090,111 @@ function AdminAppInner() {
   // autofill next time instead of being retyped. Also the same roster a
   // future mass-text recipient picker would draw from.
   const [clients, setClients] = useState([]);
+
+  // ---- shared setup: everything Sierra sets up is saved on the server, so the
+  // client page and her other devices all see the same thing ----
+  const [syncStatus, setSyncStatus] = useState("loading"); // loading | saved | saving | error | loadfail
+  const loadedRef = useRef(false);
+  const skipSaveRef = useRef(false);
+  const dirtyRef = useRef(false);
+  const savingRef = useRef(false);
+  const pendingRef = useRef(null);
+  const retryRef = useRef(null);
+  const revRef = useRef(0);
+  const applyRemote = d => {
+    skipSaveRef.current = true;
+    if (d.services) setServices(d.services);
+    if (d.hours) setHours(d.hours);
+    setHourOverrides(d.hourOverrides || {});
+    setReleasedDays(d.releasedDays || {});
+    setItemsByDay(d.itemsByDay || {});
+    setClients(d.clients || []);
+    revRef.current = d.rev || 0;
+  };
+  const loadShared = async isFirst => {
+    try {
+      const res = await adminFetch("/.netlify/functions/state?admin=1", pin);
+      if (res.status === 401) {
+        onAuthFail();
+        return;
+      }
+      if (!res.ok) throw new Error("bad response");
+      const d = await res.json();
+      if (isFirst) {
+        if (d.initialized) applyRemote(d);
+        loadedRef.current = true;
+        setSyncStatus("saved");
+      } else if (d.initialized && (d.rev || 0) > revRef.current && !dirtyRef.current && !savingRef.current) {
+        applyRemote(d);
+      }
+    } catch (e) {
+      if (isFirst) setSyncStatus("loadfail");
+    }
+  };
+  const flushSave = async () => {
+    if (savingRef.current) return;
+    clearTimeout(retryRef.current);
+    while (pendingRef.current) {
+      const snap = pendingRef.current;
+      pendingRef.current = null;
+      savingRef.current = true;
+      try {
+        const res = await adminFetch("/.netlify/functions/state", pin, {
+          method: "POST",
+          body: JSON.stringify(snap)
+        });
+        if (res.status === 401) {
+          savingRef.current = false;
+          onAuthFail();
+          return;
+        }
+        if (!res.ok) throw new Error("bad response");
+        const out = await res.json();
+        revRef.current = out.rev;
+      } catch (e) {
+        pendingRef.current = pendingRef.current || snap;
+        savingRef.current = false;
+        setSyncStatus("error");
+        retryRef.current = setTimeout(flushSave, 4000);
+        return;
+      }
+      savingRef.current = false;
+    }
+    dirtyRef.current = false;
+    setSyncStatus("saved");
+  };
+  useEffect(() => {
+    loadShared(true);
+    const interval = setInterval(() => loadShared(false), 15000);
+    const onHide = () => {
+      if (document.visibilityState === "hidden" && pendingRef.current) flushSave();
+    };
+    document.addEventListener("visibilitychange", onHide);
+    return () => {
+      clearInterval(interval);
+      document.removeEventListener("visibilitychange", onHide);
+      if (pendingRef.current) flushSave();
+    };
+  }, []);
+  useEffect(() => {
+    if (!loadedRef.current) return; // never save before the first successful load
+    if (skipSaveRef.current) {
+      skipSaveRef.current = false;
+      return;
+    }
+    pendingRef.current = {
+      services,
+      hours,
+      hourOverrides,
+      releasedDays,
+      itemsByDay,
+      clients
+    };
+    dirtyRef.current = true;
+    setSyncStatus("saving");
+    const t = setTimeout(flushSave, 700);
+    return () => clearTimeout(t);
+  }, [services, hours, hourOverrides, releasedDays, itemsByDay, clients]);
   const [showClientSuggestions, setShowClientSuggestions] = useState(false);
   const clientMatches = useMemo(() => {
     const q = bookingForm.client.trim().toLowerCase();
@@ -2511,7 +2649,30 @@ function AdminAppInner() {
       color: "#B8ACA6",
       marginBottom: 14
     }
-  }, "Couldn't reach the shared inbox right now — incoming client requests won't show up until this reconnects."), submissions.length > 0 && /*#__PURE__*/React.createElement("div", {
+  }, "Couldn't reach the shared inbox right now — incoming client requests won't show up until this reconnects."), syncStatus === "loadfail" && /*#__PURE__*/React.createElement("p", {
+    style: {
+      fontSize: 12.5,
+      color: "#B5443C",
+      marginBottom: 14
+    }
+  }, "Couldn't load your saved setup, so changes can't be saved right now. ", /*#__PURE__*/React.createElement("button", {
+    onClick: () => loadShared(true),
+    style: {
+      background: "none",
+      border: "none",
+      color: "#B5443C",
+      textDecoration: "underline",
+      cursor: "pointer",
+      fontSize: 12.5,
+      padding: 0
+    }
+  }, "Try again")), syncStatus !== "loadfail" && /*#__PURE__*/React.createElement("p", {
+    style: {
+      fontSize: 11.5,
+      marginBottom: 12,
+      color: syncStatus === "error" ? "#B5443C" : "#8A8180"
+    }
+  }, syncStatus === "loading" ? "Loading your schedule\u2026" : syncStatus === "saving" ? "Saving\u2026" : syncStatus === "error" ? "Couldn't save your last change \u2014 retrying\u2026" : "All changes saved"), submissions.length > 0 && /*#__PURE__*/React.createElement("div", {
     style: {
       marginBottom: 20
     }
@@ -3182,19 +3343,40 @@ function AdminAppInner() {
   }, h.closed ? "Open this day" : "Mark closed"))))));
 }
 
-// Change this to whatever code Sierra wants to use to get into her dashboard.
-const ADMIN_PIN = "SIERRA1";
+// The owner code is checked by the server (see ADMIN_PIN in Netlify), not here.
+function adminFetch(path, pin, opts = {}) {
+  return fetch(path, {
+    ...opts,
+    cache: "no-store",
+    headers: {
+      "Content-Type": "application/json",
+      "x-admin-pin": pin,
+      ...(opts.headers || {})
+    }
+  });
+}
 function PinGate({
   onUnlock,
   onBack
 }) {
   const [pin, setPin] = useState("");
   const [error, setError] = useState("");
-  const tryUnlock = () => {
-    if (pin.trim().toUpperCase() === ADMIN_PIN) {
-      onUnlock();
-    } else {
-      setError("That's not right — try again.");
+  const [checking, setChecking] = useState(false);
+  const tryUnlock = async () => {
+    const code = pin.trim().toUpperCase();
+    if (!code) return;
+    setChecking(true);
+    try {
+      const res = await adminFetch("/.netlify/functions/state?admin=1", code);
+      if (res.ok) {
+        onUnlock(code);
+        return;
+      }
+      setError(res.status === 401 ? "That's not right — try again." : "Couldn't check the code right now. Try again in a moment.");
+    } catch (e) {
+      setError("Couldn't check the code right now. Try again in a moment.");
+    } finally {
+      setChecking(false);
     }
   };
   return /*#__PURE__*/React.createElement("div", {
@@ -3287,11 +3469,51 @@ function PinGate({
   }, "Back to booking")));
 }
 function App() {
-  const [mode, setMode] = useState("client"); // 'client' | 'pin' | 'admin'
+  const [pin, setPin] = useState(() => {
+    try {
+      return sessionStorage.getItem("ss_pin") || "";
+    } catch (e) {
+      return "";
+    }
+  });
+  const [mode, setMode] = useState(() => pin ? "admin" : "client"); // 'client' | 'pin' | 'admin'
 
-  if (mode === "admin") return React.createElement(AdminAppInner);
+  const lock = () => {
+    try {
+      sessionStorage.removeItem("ss_pin");
+    } catch (e) {}
+    setPin("");
+    setMode("client");
+  };
+  if (mode === "admin") return React.createElement(React.Fragment, null, React.createElement(AdminAppInner, {
+    pin,
+    onAuthFail: lock
+  }), React.createElement("div", {
+    style: {
+      display: "flex",
+      justifyContent: "flex-start",
+      padding: "4px 16px 16px",
+      background: "#FAF6F2"
+    }
+  }, React.createElement("button", {
+    onClick: lock,
+    style: {
+      background: "none",
+      border: "none",
+      color: "#8A8180",
+      fontSize: 12,
+      cursor: "pointer",
+      padding: "8px 4px"
+    }
+  }, "Lock & leave dashboard")));
   if (mode === "pin") return React.createElement(PinGate, {
-    onUnlock: () => setMode("admin"),
+    onUnlock: code => {
+      try {
+        sessionStorage.setItem("ss_pin", code);
+      } catch (e) {}
+      setPin(code);
+      setMode("admin");
+    },
     onBack: () => setMode("client")
   });
   return React.createElement(React.Fragment, null, React.createElement(ClientAppInner), React.createElement("div", {
