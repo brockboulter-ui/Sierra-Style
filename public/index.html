@@ -169,7 +169,16 @@ function telHref(phone) {
 function smsHref(phone, message) {
   return `sms:${phone.replace(/\D/g, "")}?&body=${encodeURIComponent(message)}`;
 }
-function buildConfirmationMessage(item, services, date) {
+function newToken() {
+  try {
+    const a = new Uint8Array(16);
+    crypto.getRandomValues(a);
+    return Array.from(a, b => b.toString(16).padStart(2, "0")).join("");
+  } catch (e) {
+    return (Date.now().toString(16) + Math.random().toString(16).slice(2) + Math.random().toString(16).slice(2) + "00000000000000000000000000000000").replace(/[^a-f0-9]/g, "0").slice(0, 32);
+  }
+}
+function buildConfirmationMessage(item, services, date, token) {
   const serviceNames = item.serviceIds.map(id => services.find(s => s.id === id)?.name).filter(Boolean).join(" + ");
   const dateStr = date.toLocaleDateString("en-US", {
     weekday: "long",
@@ -177,7 +186,8 @@ function buildConfirmationMessage(item, services, date) {
     day: "numeric"
   });
   const firstName = (item.client || "").split(" ")[0] || "there";
-  return `Hi ${firstName}! Your ${serviceNames || "appointment"} at Sierra Style is confirmed for ${dateStr} at ${formatTime(item.start)}. See you then!`;
+  const link = token ? ` Please tap to confirm: ${window.location.origin}/?c=${token}` : "";
+  return `Hi ${firstName}! I have you down for ${serviceNames || "an appointment"} at Sierra Style on ${dateStr} at ${formatTime(item.start)}.${link} See you then!`;
 }
 
 // Classic calendar-overlap layout: clusters mutually-overlapping bookings and
@@ -237,14 +247,16 @@ const DEFAULT_SHARED = {
   hours: DEFAULT_HOURS,
   hourOverrides: {},
   releasedDays: {},
-  blocksByDay: {}
+  blocksByDay: {},
+  announcements: []
 };
 const EMPTY_SHARED = {
   services: [],
   hours: DEFAULT_HOURS,
   hourOverrides: {},
   releasedDays: {},
-  blocksByDay: {}
+  blocksByDay: {},
+  announcements: []
 };
 
 // Convention: a selected window means the client is free start-to-finish
@@ -732,11 +744,12 @@ const aStyles = {
   },
   tabRow: {
     display: "flex",
+    flexWrap: "wrap",
     gap: 8,
     marginBottom: 22
   },
   tabButton: {
-    flex: 1,
+    flex: "1 1 calc(50% - 4px)",
     display: "flex",
     alignItems: "center",
     justifyContent: "center",
@@ -1766,7 +1779,9 @@ function ClientAppInner() {
     src: LOGO_SRC,
     alt: "Sierra Style Hair & Lashes",
     style: cStyles.logoMark
-  })), /*#__PURE__*/React.createElement("div", {
+  })), cfg.announcements && cfg.announcements.length > 0 && React.createElement(NewsBoard, {
+    items: cfg.announcements
+  }), /*#__PURE__*/React.createElement("div", {
     style: cStyles.serviceRow
   }, services.map(s => {
     const Icon = s.icon;
@@ -2090,6 +2105,20 @@ function AdminAppInner({
   // autofill next time instead of being retyped. Also the same roster a
   // future mass-text recipient picker would draw from.
   const [clients, setClients] = useState([]);
+  const [announcements, setAnnouncements] = useState([]);
+  const [confirmations, setConfirmations] = useState({});
+  const [smsDraft, setSmsDraft] = useState(() => {
+    try {
+      return localStorage.getItem("ss_msg") || "Hi {first}! ";
+    } catch (e) {
+      return "Hi {first}! ";
+    }
+  });
+  useEffect(() => {
+    try {
+      localStorage.setItem("ss_msg", smsDraft);
+    } catch (e) {}
+  }, [smsDraft]);
 
   // ---- shared setup: everything Sierra sets up is saved on the server, so the
   // client page and her other devices all see the same thing ----
@@ -2109,6 +2138,7 @@ function AdminAppInner({
     setReleasedDays(d.releasedDays || {});
     setItemsByDay(d.itemsByDay || {});
     setClients(d.clients || []);
+    setAnnouncements(d.announcements || []);
     revRef.current = d.rev || 0;
   };
   const loadShared = async isFirst => {
@@ -2120,6 +2150,7 @@ function AdminAppInner({
       }
       if (!res.ok) throw new Error("bad response");
       const d = await res.json();
+      if (d.confirmations) setConfirmations(d.confirmations);
       if (isFirst) {
         if (d.initialized) applyRemote(d);
         loadedRef.current = true;
@@ -2188,13 +2219,86 @@ function AdminAppInner({
       hourOverrides,
       releasedDays,
       itemsByDay,
-      clients
+      clients,
+      announcements
     };
     dirtyRef.current = true;
     setSyncStatus("saving");
     const t = setTimeout(flushSave, 700);
     return () => clearTimeout(t);
-  }, [services, hours, hourOverrides, releasedDays, itemsByDay, clients]);
+  }, [services, hours, hourOverrides, releasedDays, itemsByDay, clients, announcements]);
+
+  // New client requests go straight onto the calendar as tentative "new"
+  // appointments (remembering the times the client said they're free) instead
+  // of waiting in a separate inbox. The request is only cleared from the
+  // server once the calendar holding it has been saved.
+  useEffect(() => {
+    if (!loadedRef.current || syncStatus === "loadfail" || !submissions.length) return;
+    const known = new Set();
+    Object.values(itemsByDay).forEach(list => (list || []).forEach(i => i && i.srcId && known.add(i.srcId)));
+    const fresh = submissions.filter(sub => !known.has(sub.id));
+    if (!fresh.length) return;
+    const additions = {};
+    fresh.forEach(sub => {
+      const ranges = sub.ranges || [];
+      const r0 = ranges[0];
+      const winStart = r0 ? r0.start : 540;
+      const winEnd = r0 ? r0.end : winStart + 60;
+      const len = Math.max(15, Math.min(60, winEnd - winStart));
+      const ids = (sub.serviceIds || []).filter(id => services.some(sv => sv.id === id));
+      const key = sub.dateKey || new Date().toDateString();
+      (additions[key] = additions[key] || []).push({
+        id: `req-${sub.id}`,
+        srcId: sub.id,
+        type: "booking",
+        client: sub.client || "New client",
+        phone: sub.phone || "",
+        serviceIds: ids.length ? ids : [services[0]?.id].filter(Boolean),
+        start: fromMinutes(winStart),
+        end: fromMinutes(winStart + len),
+        note: sub.note || "",
+        originalWindow: ranges.map(r => r.label).join(", "),
+        windows: ranges.map(r => ({
+          start: fromMinutes(r.start),
+          end: fromMinutes(r.end)
+        })),
+        isNew: true,
+        submittedAt: sub.submittedAt || "",
+        notified: false,
+        confirmed: false
+      });
+      rememberClient(sub.client || "", sub.phone || "");
+    });
+    setItemsByDay(prev => {
+      const next = {
+        ...prev
+      };
+      Object.entries(additions).forEach(([k, arr]) => {
+        const have = new Set((next[k] || []).map(i => i.srcId).filter(Boolean));
+        next[k] = [...(next[k] || []), ...arr.filter(a => !have.has(a.srcId))];
+      });
+      return next;
+    });
+  }, [submissions, syncStatus]);
+  const dismissedRef = useRef(new Set());
+  useEffect(() => {
+    if (!loadedRef.current || dirtyRef.current || savingRef.current || syncStatus !== "saved") return;
+    const known = new Set();
+    Object.values(itemsByDay).forEach(list => (list || []).forEach(i => i && i.srcId && known.add(i.srcId)));
+    submissions.forEach(sub => {
+      if (!known.has(sub.id) || dismissedRef.current.has(sub.id)) return;
+      dismissedRef.current.add(sub.id);
+      setSubmissions(prev => prev.filter(x => x.id !== sub.id));
+      adminFetch("/.netlify/functions/dismiss", pin, {
+        method: "POST",
+        body: JSON.stringify({
+          id: sub.id
+        })
+      }).then(r => {
+        if (!r.ok) dismissedRef.current.delete(sub.id);
+      }).catch(() => dismissedRef.current.delete(sub.id));
+    });
+  }, [submissions, itemsByDay, syncStatus]);
   const [showClientSuggestions, setShowClientSuggestions] = useState(false);
   const clientMatches = useMemo(() => {
     const q = bookingForm.client.trim().toLowerCase();
@@ -2561,7 +2665,8 @@ function AdminAppInner({
       ...i,
       start: editForm.start,
       end: editForm.end,
-      serviceIds: editForm.serviceIds
+      serviceIds: editForm.serviceIds,
+      isNew: false
     } : i));
     setEditingBookingId(null);
   };
@@ -2569,23 +2674,95 @@ function AdminAppInner({
     setItemsForDay(prev => prev.filter(i => i.id !== id));
     closeModal();
   };
+  // Each appointment gets a private link. The text includes it, and when the
+  // client taps "Yes, I'll be there" the calendar turns green on its own.
   const sendConfirmation = item => {
+    const token = item.token || newToken();
     if (item.phone) {
-      const message = buildConfirmationMessage(item, services, selectedDate);
+      const message = buildConfirmationMessage(item, services, selectedDate, token);
       window.location.href = smsHref(item.phone, message);
     }
     setItemsForDay(prev => prev.map(i => i.id === item.id ? {
       ...i,
-      notified: true
+      notified: true,
+      token,
+      isNew: false
     } : i));
   };
-  // Stands in for the client actually replying once real two-way texting
-  // exists — for now this button lets you see how the calendar reflects it.
-  const mockClientConfirm = id => {
+  // For when a client just texts back "yes" instead of tapping the link.
+  const markConfirmed = id => {
     setItemsForDay(prev => prev.map(i => i.id === id ? {
       ...i,
-      confirmed: true
+      confirmed: true,
+      isNew: false
     } : i));
+  };
+  const patchItem = (dk, id, patch) => setItemsByDay(prev => ({
+    ...prev,
+    [dk]: (prev[dk] || []).map(i => i.id === id ? {
+      ...i,
+      ...patch
+    } : i)
+  }));
+  const attention = useMemo(() => {
+    const out = [];
+    Object.entries(itemsByDay).forEach(([dk, list]) => (list || []).forEach(i => {
+      if (!i || i.type !== "booking") return;
+      if (i.isNew) {
+        out.push({
+          kind: "new",
+          dk,
+          item: i
+        });
+        return;
+      }
+      const rec = confRecord(confirmations, dk, i);
+      if (rec && rec.at !== "manual" && i.confAck !== rec.at) out.push({
+        kind: rec.response === "change" ? "change" : "confirm",
+        dk,
+        item: i,
+        at: rec.at
+      });
+    }));
+    out.sort((a, b) => String(a.item.submittedAt || a.at || "").localeCompare(String(b.item.submittedAt || b.at || "")));
+    return out;
+  }, [itemsByDay, confirmations]);
+  const ackEntry = a => patchItem(a.dk, a.item.id, a.kind === "new" ? {
+    isNew: false
+  } : {
+    confAck: a.at
+  });
+  const ackAll = () => setItemsByDay(prev => {
+    const next = {
+      ...prev
+    };
+    attention.forEach(a => {
+      next[a.dk] = (next[a.dk] || []).map(i => i.id === a.item.id ? {
+        ...i,
+        ...(a.kind === "new" ? {
+          isNew: false
+        } : {
+          confAck: a.at
+        })
+      } : i);
+    });
+    return next;
+  });
+  const viewEntry = a => {
+    const d = new Date(a.dk);
+    if (!isNaN(d)) {
+      setSelectedDate(d);
+      setViewMonth(new Date(d.getFullYear(), d.getMonth(), 1));
+    }
+    setTab("schedule");
+    setCreating(null);
+    setEditingBookingId(null);
+    setConfirmDeleteId(null);
+    setSelectedBookingId(null);
+  };
+  const textAboutAnnouncement = a => {
+    setSmsDraft(`Hi {first}! ${a.title ? a.title + (a.body ? ". " : "") : ""}${a.body || ""} ${window.location.origin}`.replace(/\s+/g, " ").trim() + " ");
+    setTab("clients");
   };
   const changeMonth = delta => {
     setViewMonth(prev => new Date(prev.getFullYear(), prev.getMonth() + delta, 1));
@@ -2615,6 +2792,8 @@ function AdminAppInner({
   }
   const gridHeight = (dayEndMin - dayStartMin) * PX_PER_MIN;
   const selectedItem = bookingItems.find(b => b.id === selectedBookingId);
+  const selRec = selectedItem ? confRecord(confirmations, dayKey, selectedItem) : null;
+  const bandItems = bookingItems.filter(i => i.windows && i.windows.length && (i.isNew || i.id === selectedBookingId || !i.notified));
   return /*#__PURE__*/React.createElement("div", {
     style: aStyles.page
   }, /*#__PURE__*/React.createElement("div", {
@@ -2635,7 +2814,23 @@ function AdminAppInner({
     }
   }, /*#__PURE__*/React.createElement(Calendar, {
     size: 15
-  }), " Schedule"), /*#__PURE__*/React.createElement("button", {
+  }), " Schedule"), React.createElement("button", {
+    onClick: () => setTab("announcements"),
+    style: {
+      ...aStyles.tabButton,
+      ...(tab === "announcements" ? aStyles.tabButtonActive : {})
+    }
+  }, React.createElement(Bell, {
+    size: 15
+  }), " Announcements"), React.createElement("button", {
+    onClick: () => setTab("clients"),
+    style: {
+      ...aStyles.tabButton,
+      ...(tab === "clients" ? aStyles.tabButtonActive : {})
+    }
+  }, React.createElement(Users, {
+    size: 15
+  }), " Clients"), /*#__PURE__*/React.createElement("button", {
     onClick: () => setTab("settings"),
     style: {
       ...aStyles.tabButton,
@@ -2672,65 +2867,13 @@ function AdminAppInner({
       marginBottom: 12,
       color: syncStatus === "error" ? "#B5443C" : "#8A8180"
     }
-  }, syncStatus === "loading" ? "Loading your schedule\u2026" : syncStatus === "saving" ? "Saving\u2026" : syncStatus === "error" ? "Couldn't save your last change \u2014 retrying\u2026" : "All changes saved"), submissions.length > 0 && /*#__PURE__*/React.createElement("div", {
-    style: {
-      marginBottom: 20
-    }
-  }, /*#__PURE__*/React.createElement("div", {
-    style: aStyles.slotSectionHeader
-  }, /*#__PURE__*/React.createElement("span", {
-    style: aStyles.slotSectionLabel
-  }, "Incoming requests (", submissions.length, ")")), /*#__PURE__*/React.createElement("div", {
-    style: {
-      display: "flex",
-      flexDirection: "column",
-      gap: 8
-    }
-  }, submissions.map(sub => /*#__PURE__*/React.createElement("div", {
-    key: sub.id,
-    style: {
-      background: "#FFFFFF",
-      border: "1px solid #E8DFDA",
-      borderRadius: 10,
-      padding: "10px 12px"
-    }
-  }, /*#__PURE__*/React.createElement("div", {
-    style: {
-      fontSize: 13,
-      fontWeight: 600
-    }
-  }, sub.client), /*#__PURE__*/React.createElement("div", {
-    style: {
-      fontSize: 11.5,
-      color: "#7A716F",
-      marginTop: 2
-    }
-  }, (sub.serviceNames || []).join(" + "), " \\u00b7 ", sub.dateLabel), /*#__PURE__*/React.createElement("div", {
-    style: {
-      fontSize: 11.5,
-      color: "#7A716F",
-      marginTop: 2
-    }
-  }, (sub.ranges || []).map(r => r.label).join(", ")), sub.note && /*#__PURE__*/React.createElement("div", {
-    style: {
-      fontSize: 11.5,
-      color: "#8A8180",
-      fontStyle: "italic",
-      marginTop: 4
-    }
-  }, "\"", sub.note, "\""), /*#__PURE__*/React.createElement("div", {
-    style: {
-      display: "flex",
-      gap: 8,
-      marginTop: 8
-    }
-  }, /*#__PURE__*/React.createElement("button", {
-    style: aStyles.primaryButtonSmall,
-    onClick: () => openCreateFromSubmission(sub)
-  }, "Add to calendar"), /*#__PURE__*/React.createElement("button", {
-    style: aStyles.ghostButtonSmall,
-    onClick: () => dismissSubmission(sub.id)
-  }, "Dismiss")))))), tab === "schedule" && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
+  }, syncStatus === "loading" ? "Loading your schedule\u2026" : syncStatus === "saving" ? "Saving\u2026" : syncStatus === "error" ? "Couldn't save your last change \u2014 retrying\u2026" : "All changes saved"), attention.length > 0 && React.createElement(AttentionList, {
+    attention,
+    services,
+    onAck: ackEntry,
+    onAckAll: ackAll,
+    onView: viewEntry
+  }), tab === "schedule" && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
     style: aStyles.dayStripHeader
   }, /*#__PURE__*/React.createElement("button", {
     onClick: () => changeMonth(-1),
@@ -2751,7 +2894,7 @@ function AdminAppInner({
     const isSelected = sameDay(d, selectedDate);
     const isToday = sameDay(d, today);
     const released = isReleasedFor(d);
-    const pending = submissions.filter(s => s.dateKey === d.toDateString()).length;
+    const pending = (itemsByDay[d.toDateString()] || []).filter(i => i && i.type === "booking" && i.isNew).length;
     return /*#__PURE__*/React.createElement("div", {
       key: i,
       style: aStyles.dayPillWrap
@@ -2768,7 +2911,7 @@ function AdminAppInner({
       }
     }, pending > 0 && /*#__PURE__*/React.createElement("span", {
       style: aStyles.pendingBadge,
-      title: `${pending} client time${pending > 1 ? "s" : ""} submitted`
+      title: `${pending} new request${pending > 1 ? "s" : ""}`
     }, pending), /*#__PURE__*/React.createElement("span", {
       style: {
         fontSize: 11,
@@ -2988,7 +3131,7 @@ function AdminAppInner({
     }, s.price));
   })), /*#__PURE__*/React.createElement("p", {
     style: aStyles.helperNote
-  }, "Set the time yourself \\u2014 every appointment's length is up to you. Picking a time that's already booked will double-book it."), /*#__PURE__*/React.createElement("div", {
+  }, "Set the time yourself \u2014 every appointment's length is up to you. Picking a time that's already booked will double-book it."), /*#__PURE__*/React.createElement("div", {
     style: aStyles.blockFormActions
   }, /*#__PURE__*/React.createElement("button", {
     style: aStyles.ghostButtonSmall,
@@ -3017,7 +3160,35 @@ function AdminAppInner({
     }
   }, /*#__PURE__*/React.createElement("span", {
     style: aStyles.hourLabel
-  }, formatTime(fromMinutes(m))))), blockItems.map(b => {
+  }, formatTime(fromMinutes(m))))), bandItems.map(it => it.windows.map((w, k) => {
+    const ws = Math.max(toMinutes(w.start), dayStartMin);
+    const we = Math.min(toMinutes(w.end), dayEndMin);
+    if (we <= ws) return null;
+    return React.createElement("div", {
+      key: `${it.id}-w${k}`,
+      "data-band": it.id,
+      style: {
+        position: "absolute",
+        left: 0,
+        right: 0,
+        top: (ws - dayStartMin) * PX_PER_MIN,
+        height: (we - ws) * PX_PER_MIN,
+        background: "rgba(201,123,132,0.10)",
+        borderLeft: "3px solid rgba(201,123,132,0.5)",
+        borderRadius: 4,
+        pointerEvents: "none",
+        zIndex: 0
+      }
+    }, React.createElement("span", {
+      style: {
+        position: "absolute",
+        right: 4,
+        top: 1,
+        fontSize: 10,
+        color: "#B98A8F"
+      }
+    }, (it.client || "").split(" ")[0], " is free"));
+  })), blockItems.map(b => {
     const start = toMinutes(b.start);
     const end = toMinutes(b.end);
     const top = (start - dayStartMin) * PX_PER_MIN;
@@ -3056,7 +3227,19 @@ function AdminAppInner({
     const widthPct = 100 / maxCols;
     const leftPct = col * widthPct;
     const isSelected = selectedBookingId === item.id;
-    const statusStyle = item.confirmed ? aStyles.bookingBlockConfirmed : item.notified ? aStyles.bookingBlockNotified : {};
+    const rec = confRecord(confirmations, dayKey, item);
+    const statusStyle = {
+      ...(rec && rec.response === "confirm" ? aStyles.bookingBlockConfirmed : item.notified ? aStyles.bookingBlockNotified : {}),
+      ...(item.isNew ? {
+        borderStyle: "dashed",
+        borderColor: "#C97B84",
+        borderWidth: 2
+      } : {}),
+      ...(rec && rec.response === "change" ? {
+        background: "#F4D9D6",
+        borderColor: "#C0453B"
+      } : {})
+    };
     const commonPos = {
       left: `calc(${leftPct}% + 2px)`,
       width: `calc(${widthPct}% - 4px)`
@@ -3078,9 +3261,9 @@ function AdminAppInner({
       }
     }, /*#__PURE__*/React.createElement("div", {
       style: aStyles.bookingBlockName
-    }, item.client), height > 34 && /*#__PURE__*/React.createElement("div", {
+    }, (item.isNew ? "\u25cf " : rec && rec.response === "change" ? "\u21ba " : "") + item.client), height > 34 && /*#__PURE__*/React.createElement("div", {
       style: aStyles.bookingBlockTime
-    }, formatTime(fromMinutes(start)), " \\u2013 ", formatTime(fromMinutes(end))), item.note && /*#__PURE__*/React.createElement("div", {
+    }, formatTime(fromMinutes(start)), " \u2013 ", formatTime(fromMinutes(end))), item.note && /*#__PURE__*/React.createElement("div", {
       style: aStyles.bookingBlockNote
     }, item.note)), /*#__PURE__*/React.createElement("div", {
       style: {
@@ -3129,7 +3312,15 @@ function AdminAppInner({
       background: "#E7EFE2",
       border: "1px solid #A9C299"
     }
-  }), " Client confirmed")), selectedItem && /*#__PURE__*/React.createElement("div", {
+  }), " Client confirmed"), React.createElement("span", {
+    style: aStyles.legendItem
+  }, React.createElement("span", {
+    style: {
+      ...aStyles.legendDot,
+      background: "#FFFFFF",
+      border: "2px dashed #C97B84"
+    }
+  }), " New request")), selectedItem && /*#__PURE__*/React.createElement("div", {
     style: aStyles.modalBackdrop,
     onClick: closeModal
   }, /*#__PURE__*/React.createElement("div", {
@@ -3248,13 +3439,15 @@ function AdminAppInner({
     style: aStyles.noteBoxText
   }, selectedItem.note)), /*#__PURE__*/React.createElement("div", {
     style: aStyles.statusRow
-  }, selectedItem.confirmed ? /*#__PURE__*/React.createElement("span", {
+  }, selRec && selRec.response === "change" ? /*#__PURE__*/React.createElement("span", {
+    style: aStyles.statusPillPending
+  }, "Client asked for a different time") : selRec ? /*#__PURE__*/React.createElement("span", {
     style: aStyles.statusPillConfirmed
   }, /*#__PURE__*/React.createElement(Check, {
     size: 12
   }), " Client confirmed") : selectedItem.notified ? /*#__PURE__*/React.createElement("span", {
     style: aStyles.statusPillNotified
-  }, "Confirmation sent \\u2014 awaiting reply") : /*#__PURE__*/React.createElement("span", {
+  }, "Confirmation sent \u2014 awaiting reply") : /*#__PURE__*/React.createElement("span", {
     style: aStyles.statusPillPending
   }, "Not yet notified")), /*#__PURE__*/React.createElement("div", {
     style: aStyles.expandedActions
@@ -3273,10 +3466,22 @@ function AdminAppInner({
   }, !selectedItem.notified && /*#__PURE__*/React.createElement("button", {
     style: aStyles.primaryButtonSmall,
     onClick: () => sendConfirmation(selectedItem)
-  }, "Send confirmation text"), selectedItem.notified && !selectedItem.confirmed && /*#__PURE__*/React.createElement("button", {
+  }, "Send confirmation text"), selectedItem.notified && !(selRec && selRec.response === "confirm") && /*#__PURE__*/React.createElement(React.Fragment, null, React.createElement("button", {
     style: aStyles.ghostButtonSmall,
-    onClick: () => mockClientConfirm(selectedItem.id)
-  }, "Simulate client confirming (test only)")))))), tab === "settings" && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
+    onClick: () => sendConfirmation(selectedItem)
+  }, "Send link again"), React.createElement("button", {
+    style: aStyles.ghostButtonSmall,
+    onClick: () => markConfirmed(selectedItem.id)
+  }, "Mark confirmed"))))))), tab === "announcements" && React.createElement(AnnouncementsTab, {
+    announcements,
+    setAnnouncements,
+    onTextAll: textAboutAnnouncement
+  }), tab === "clients" && React.createElement(ClientsTab, {
+    clients,
+    setClients,
+    message: smsDraft,
+    setMessage: setSmsDraft
+  }), tab === "settings" && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
     style: aStyles.settingsSection
   }, /*#__PURE__*/React.createElement("h2", {
     style: aStyles.settingsHeading
@@ -3355,6 +3560,1008 @@ function adminFetch(path, pin, opts = {}) {
     }
   });
 }
+// ===================== new in this update =====================
+const el = React.createElement;
+const BASE_TITLE = document.title;
+const Bell = makeIcon(["M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9", "M13.7 21a2 2 0 0 1-3.4 0"]);
+const Users = makeIconCircle(9, 7, 4, ["M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2", "M23 21v-2a4 4 0 0 0-3-3.87", "M16 3.13a4 4 0 0 1 0 7.75"]);
+
+const xs = {
+  card: {
+    background: "#FFFFFF",
+    border: "1px solid #E8DFDA",
+    borderRadius: 12,
+    padding: "12px 14px"
+  },
+  label: {
+    fontSize: 10.5,
+    textTransform: "uppercase",
+    letterSpacing: 0.5,
+    color: "#B8ACA6",
+    fontWeight: 600,
+    marginBottom: 4
+  },
+  textarea: {
+    border: "1px solid #E8DFDA",
+    borderRadius: 8,
+    padding: "8px 10px",
+    fontSize: 13,
+    fontFamily: "inherit",
+    width: "100%",
+    boxSizing: "border-box",
+    minHeight: 76,
+    resize: "vertical"
+  },
+  badge: {
+    minWidth: 18,
+    height: 18,
+    borderRadius: 9,
+    background: "#C0453B",
+    color: "#FFFFFF",
+    fontSize: 11,
+    fontWeight: 700,
+    display: "inline-flex",
+    alignItems: "center",
+    justifyContent: "center",
+    padding: "0 5px",
+    boxSizing: "border-box"
+  }
+};
+
+const confRecord = (confirmations, dayKey, item) => {
+  if (item.confirmed) return {
+    response: "confirm",
+    at: "manual"
+  };
+  const c = item.token && confirmations && confirmations[item.token];
+  if (c && c.date === dayKey && c.start === item.start) return c;
+  return null;
+};
+const niceDay = dk => {
+  const d = new Date(dk);
+  return isNaN(d) ? dk : d.toLocaleDateString("en-US", {
+    weekday: "short",
+    month: "short",
+    day: "numeric"
+  });
+};
+const firstNameOf = c => (c && c.name || "").trim().split(/\s+/)[0] || "there";
+const personalize = (msg, c) => msg.replace(/\{first\}/gi, firstNameOf(c));
+
+// ---- Sierra: the "needs your attention" list (new requests + client answers) ----
+function AttentionList({
+  attention,
+  services,
+  onAck,
+  onAckAll,
+  onView
+}) {
+  return el("div", {
+    style: {
+      marginBottom: 20
+    }
+  }, el("div", {
+    style: {
+      ...aStyles.slotSectionHeader,
+      alignItems: "center"
+    }
+  }, el("span", {
+    style: aStyles.slotSectionLabel
+  }, "Needs your attention (", attention.length, ")"), attention.length > 1 && el("button", {
+    style: aStyles.ghostButtonSmall,
+    onClick: onAckAll
+  }, "Got it, all")), el("div", {
+    style: {
+      display: "flex",
+      flexDirection: "column",
+      gap: 8
+    }
+  }, attention.map(a => {
+    const it = a.item;
+    const names = (it.serviceIds || []).map(id => services.find(s => s.id === id)?.name).filter(Boolean).join(" + ");
+    const title = a.kind === "new" ? `New request · ${it.client}` : a.kind === "confirm" ? `${it.client} confirmed` : `${it.client} needs a different time`;
+    return el("div", {
+      key: it.id + a.kind,
+      style: {
+        ...xs.card,
+        padding: "10px 12px",
+        borderColor: a.kind === "change" ? "#E3B8B4" : a.kind === "confirm" ? "#A9C299" : "#E8DFDA"
+      }
+    }, el("div", {
+      style: {
+        fontSize: 13,
+        fontWeight: 600
+      }
+    }, title), el("div", {
+      style: {
+        fontSize: 11.5,
+        color: "#7A716F",
+        marginTop: 2
+      }
+    }, names || "Appointment", " · ", niceDay(a.dk), a.kind !== "new" ? ` · ${formatTime(it.start)}` : ""), a.kind === "new" && it.originalWindow && el("div", {
+      style: {
+        fontSize: 11.5,
+        color: "#7A716F",
+        marginTop: 2
+      }
+    }, "Free: ", it.originalWindow), a.kind === "new" && it.note && el("div", {
+      style: {
+        fontSize: 11.5,
+        color: "#8A8180",
+        fontStyle: "italic",
+        marginTop: 4
+      }
+    }, "\"", it.note, "\""), el("div", {
+      style: {
+        display: "flex",
+        gap: 8,
+        marginTop: 8
+      }
+    }, el("button", {
+      style: aStyles.primaryButtonSmall,
+      onClick: () => onAck(a)
+    }, "Got it"), el("button", {
+      style: aStyles.ghostButtonSmall,
+      onClick: () => onView(a)
+    }, "Look on calendar")));
+  })));
+}
+
+// ---- Sierra: announcement board editor ----
+function AnnouncementsTab({
+  announcements,
+  setAnnouncements,
+  onTextAll
+}) {
+  const [title, setTitle] = useState("");
+  const [body, setBody] = useState("");
+  const [expires, setExpires] = useState("");
+  const todayStr = new Date().toISOString().slice(0, 10);
+  const post = () => {
+    if (!title.trim() && !body.trim()) return;
+    setAnnouncements(prev => [{
+      id: `ann-${Date.now()}`,
+      title: title.trim(),
+      body: body.trim(),
+      createdAt: new Date().toISOString(),
+      expires
+    }, ...prev]);
+    setTitle("");
+    setBody("");
+    setExpires("");
+  };
+  const update = (id, field, value) => setAnnouncements(prev => prev.map(a => a.id === id ? {
+    ...a,
+    [field]: value
+  } : a));
+  const remove = id => setAnnouncements(prev => prev.filter(a => a.id !== id));
+  return el("div", null, el("div", {
+    style: aStyles.settingsSection
+  }, el("h2", {
+    style: aStyles.settingsHeading
+  }, "Announcement board"), el("p", {
+    style: {
+      ...aStyles.helperNote,
+      marginBottom: 12
+    }
+  }, "Clients see these under \"News from Sierra\" at the top of the booking page. A red number shows on it until they've opened it."), el("div", {
+    style: {
+      ...xs.card,
+      display: "flex",
+      flexDirection: "column",
+      gap: 8
+    }
+  }, el("input", {
+    value: title,
+    onChange: e => setTitle(e.target.value),
+    placeholder: "Title (like: Lash fills 20% off this week)",
+    style: aStyles.textInput
+  }), el("textarea", {
+    value: body,
+    onChange: e => setBody(e.target.value),
+    placeholder: "Details (optional)",
+    style: xs.textarea
+  }), el("label", {
+    style: {
+      ...aStyles.unitLabel,
+      display: "flex",
+      alignItems: "center",
+      gap: 8
+    }
+  }, "Hide after", el("input", {
+    type: "date",
+    value: expires,
+    onChange: e => setExpires(e.target.value),
+    style: {
+      ...aStyles.textInput,
+      width: "auto"
+    }
+  }), el("span", {
+    style: {
+      color: "#B8ACA6"
+    }
+  }, "(optional)")), el("div", {
+    style: {
+      display: "flex",
+      justifyContent: "flex-end"
+    }
+  }, el("button", {
+    style: aStyles.primaryButtonSmall,
+    onClick: post
+  }, "Post to board")))), announcements.length > 0 && el("div", {
+    style: aStyles.settingsSection
+  }, el("h2", {
+    style: aStyles.settingsHeading
+  }, "On the board now"), el("div", {
+    style: {
+      display: "flex",
+      flexDirection: "column",
+      gap: 10
+    }
+  }, announcements.map(a => {
+    const expired = a.expires && a.expires < todayStr;
+    return el("div", {
+      key: a.id,
+      style: {
+        ...xs.card,
+        display: "flex",
+        flexDirection: "column",
+        gap: 8,
+        opacity: expired ? 0.6 : 1
+      }
+    }, el("input", {
+      value: a.title,
+      onChange: e => update(a.id, "title", e.target.value),
+      placeholder: "Title",
+      style: {
+        ...aStyles.textInput,
+        fontWeight: 600
+      }
+    }), el("textarea", {
+      value: a.body,
+      onChange: e => update(a.id, "body", e.target.value),
+      placeholder: "Details",
+      style: xs.textarea
+    }), el("label", {
+      style: {
+        ...aStyles.unitLabel,
+        display: "flex",
+        alignItems: "center",
+        gap: 8
+      }
+    }, "Hide after", el("input", {
+      type: "date",
+      value: a.expires || "",
+      onChange: e => update(a.id, "expires", e.target.value),
+      style: {
+        ...aStyles.textInput,
+        width: "auto"
+      }
+    })), expired && el("div", {
+      style: {
+        fontSize: 11.5,
+        color: "#B5443C"
+      }
+    }, "Expired — clients no longer see this."), el("div", {
+      style: {
+        display: "flex",
+        gap: 8,
+        justifyContent: "flex-end"
+      }
+    }, el("button", {
+      style: aStyles.ghostButtonSmall,
+      onClick: () => onTextAll(a)
+    }, "Text this to clients"), el("button", {
+      style: aStyles.dangerButtonSmall,
+      onClick: () => remove(a.id)
+    }, el(Trash2, {
+      size: 12
+    }), " Delete")));
+  }))));
+}
+
+// ---- Sierra: client list + one-by-one texting ----
+function ClientsTab({
+  clients,
+  setClients,
+  message,
+  setMessage
+}) {
+  const [q, setQ] = useState("");
+  const [sel, setSel] = useState({});
+  const [nm, setNm] = useState("");
+  const [ph, setPh] = useState("");
+  const [addNote, setAddNote] = useState("");
+  const [pasteOpen, setPasteOpen] = useState(false);
+  const [paste, setPaste] = useState("");
+  const [pasteNote, setPasteNote] = useState("");
+  const [queue, setQueue] = useState(null); // { ids, idx }
+  const awaitingRef = useRef(false);
+  const digitsOf = v => (v || "").replace(/\D/g, "");
+  const hasPhone = c => digitsOf(c.phone).length >= 10;
+  const sorted = useMemo(() => [...clients].sort((a, b) => a.name.localeCompare(b.name)), [clients]);
+  const shown = useMemo(() => {
+    const t = q.trim().toLowerCase();
+    const dg = digitsOf(q);
+    if (!t) return sorted;
+    return sorted.filter(c => c.name.toLowerCase().includes(t) || dg && digitsOf(c.phone).includes(dg));
+  }, [sorted, q]);
+  const picked = sorted.filter(c => sel[c.id] && hasPhone(c));
+  const addClient = () => {
+    const name = nm.trim();
+    if (!name || digitsOf(ph).length < 10) {
+      setAddNote("Add a name and a full 10-digit phone number.");
+      return;
+    }
+    if (clients.some(c => digitsOf(c.phone) === digitsOf(ph).slice(-10))) {
+      setAddNote("That number is already on your list.");
+      return;
+    }
+    setClients(prev => [...prev, {
+      id: `client-${Date.now()}`,
+      name,
+      phone: formatPhone(ph)
+    }]);
+    setNm("");
+    setPh("");
+    setAddNote("");
+  };
+  const importPaste = () => {
+    const have = new Set(clients.map(c => digitsOf(c.phone).slice(-10)));
+    const add = [];
+    let skipped = 0;
+    paste.split(/\n|;/).forEach(line => {
+      const m = line.match(/\(?\d{3}\)?[\s.\-]*\d{3}[\s.\-]*\d{4}/);
+      if (!m) return;
+      const dg = digitsOf(m[0]);
+      if (have.has(dg)) {
+        skipped++;
+        return;
+      }
+      have.add(dg);
+      const name = line.replace(m[0], " ").replace(/\+1\b/, " ").replace(/[,\t|:\-–]+/g, " ").replace(/\s+/g, " ").trim() || "Client";
+      add.push({
+        id: `client-${Date.now()}-${add.length}`,
+        name,
+        phone: formatPhone(dg)
+      });
+    });
+    if (add.length) setClients(prev => [...prev, ...add]);
+    setPasteNote(`Added ${add.length}${skipped ? `, skipped ${skipped} already on your list` : ""}.`);
+    if (add.length) setPaste("");
+  };
+  const edit = (id, field, value) => setClients(prev => prev.map(c => c.id === id ? {
+    ...c,
+    [field]: field === "phone" ? formatPhone(value) : value
+  } : c));
+  const remove = id => {
+    setClients(prev => prev.filter(c => c.id !== id));
+    setSel(prev => {
+      const n = {
+        ...prev
+      };
+      delete n[id];
+      return n;
+    });
+  };
+  const selectAll = () => {
+    const n = {};
+    shown.forEach(c => {
+      if (hasPhone(c)) n[c.id] = true;
+    });
+    setSel(n);
+  };
+
+  // queue: Messages opens with this client's text ready; when Sierra comes back
+  // to this page it moves on to the next person.
+  const cur = queue && queue.idx < queue.ids.length ? clients.find(c => c.id === queue.ids[queue.idx]) : null;
+  useEffect(() => {
+    const onVis = () => {
+      if (document.visibilityState === "visible" && awaitingRef.current) {
+        awaitingRef.current = false;
+        setQueue(qu => qu && {
+          ...qu,
+          idx: Math.min(qu.idx + 1, qu.ids.length)
+        });
+      }
+    };
+    document.addEventListener("visibilitychange", onVis);
+    return () => document.removeEventListener("visibilitychange", onVis);
+  }, []);
+  useEffect(() => {
+    if (queue && queue.idx < queue.ids.length && !clients.some(c => c.id === queue.ids[queue.idx])) {
+      setQueue(qu => qu && {
+        ...qu,
+        idx: qu.idx + 1
+      });
+    }
+  }, [queue, clients]);
+  const startQueue = () => {
+    awaitingRef.current = false;
+    setQueue({
+      ids: picked.map(c => c.id),
+      idx: 0
+    });
+  };
+  const openText = () => {
+    if (!cur) return;
+    awaitingRef.current = true;
+    window.location.href = smsHref(cur.phone, personalize(message, cur));
+  };
+  const step = delta => {
+    awaitingRef.current = false;
+    setQueue(qu => qu && {
+      ...qu,
+      idx: Math.max(0, Math.min(qu.idx + delta, qu.ids.length))
+    });
+  };
+  const insert = text => setMessage(message + (message && !message.endsWith(" ") && !message.endsWith("\n") ? " " : "") + text);
+  const preview = picked[0] || sorted.find(hasPhone);
+  return el("div", null, el("div", {
+    style: aStyles.settingsSection
+  }, el("h2", {
+    style: aStyles.settingsHeading
+  }, "Text your clients"), el("p", {
+    style: {
+      ...aStyles.helperNote,
+      marginBottom: 10
+    }
+  }, "Write one message, pick who gets it, and tap through. Each person gets their own separate text from your phone (not a group text)."), el("div", {
+    style: {
+      ...xs.card,
+      display: "flex",
+      flexDirection: "column",
+      gap: 8
+    }
+  }, el("textarea", {
+    value: message,
+    onChange: e => setMessage(e.target.value),
+    placeholder: "Hi {first}! ...",
+    style: xs.textarea
+  }), el("div", {
+    style: {
+      display: "flex",
+      gap: 8,
+      flexWrap: "wrap"
+    }
+  }, el("button", {
+    style: aStyles.ghostButtonSmall,
+    onClick: () => insert("{first}")
+  }, "+ Their first name"), el("button", {
+    style: aStyles.ghostButtonSmall,
+    onClick: () => insert(window.location.origin)
+  }, "+ Booking link")), preview && message.trim() && el("div", {
+    style: aStyles.noteBox
+  }, el("div", {
+    style: aStyles.noteBoxLabel
+  }, "Preview (", preview.name, ")"), el("div", {
+    style: {
+      ...aStyles.noteBoxText,
+      whiteSpace: "pre-wrap"
+    }
+  }, personalize(message, preview))))), el("div", {
+    style: aStyles.settingsSection
+  }, el("div", {
+    style: {
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "space-between",
+      marginBottom: 10,
+      gap: 8
+    }
+  }, el("h2", {
+    style: {
+      ...aStyles.settingsHeading,
+      marginBottom: 0
+    }
+  }, "Clients (", clients.length, ")"), el("div", {
+    style: {
+      display: "flex",
+      gap: 6
+    }
+  }, el("button", {
+    style: aStyles.ghostButtonSmall,
+    onClick: selectAll
+  }, "Select all"), el("button", {
+    style: aStyles.ghostButtonSmall,
+    onClick: () => setSel({})
+  }, "None"))), el("button", {
+    style: {
+      ...aStyles.primaryButtonSmall,
+      width: "100%",
+      padding: "11px 14px",
+      fontSize: 13.5,
+      marginBottom: 12,
+      opacity: picked.length && message.trim() ? 1 : 0.45
+    },
+    disabled: !picked.length || !message.trim(),
+    onClick: startQueue
+  }, picked.length ? `Start texting (${picked.length})` : "Pick who to text below"), clients.length > 6 && el("input", {
+    value: q,
+    onChange: e => setQ(e.target.value),
+    placeholder: "Search name or number",
+    style: {
+      ...aStyles.textInput,
+      marginBottom: 10
+    }
+  }), el("div", {
+    style: {
+      display: "flex",
+      flexDirection: "column",
+      gap: 6
+    }
+  }, shown.map(c => el("div", {
+    key: c.id,
+    style: {
+      display: "flex",
+      alignItems: "center",
+      gap: 6
+    }
+  }, el("input", {
+    type: "checkbox",
+    checked: !!sel[c.id],
+    disabled: !hasPhone(c),
+    onChange: e => setSel(prev => ({
+      ...prev,
+      [c.id]: e.target.checked
+    })),
+    style: {
+      width: 20,
+      height: 20,
+      flexShrink: 0
+    },
+    "aria-label": `Select ${c.name}`
+  }), el("input", {
+    value: c.name,
+    onChange: e => edit(c.id, "name", e.target.value),
+    style: {
+      ...aStyles.textInput,
+      flex: 1.2,
+      minWidth: 0
+    }
+  }), el("input", {
+    value: c.phone || "",
+    onChange: e => edit(c.id, "phone", e.target.value),
+    inputMode: "tel",
+    placeholder: "Phone",
+    style: {
+      ...aStyles.textInput,
+      flex: 1,
+      minWidth: 0
+    }
+  }), el("button", {
+    style: aStyles.iconButtonTiny,
+    onClick: () => remove(c.id),
+    "aria-label": `Remove ${c.name}`
+  }, el(Trash2, {
+    size: 15,
+    color: "#B8ACA6"
+  })))), clients.length === 0 && el("p", {
+    style: aStyles.helperNote
+  }, "No clients yet. Anyone who sends a request or gets an appointment is added automatically, or add people below.")), el("div", {
+    style: {
+      ...xs.card,
+      marginTop: 14,
+      display: "flex",
+      flexDirection: "column",
+      gap: 8
+    }
+  }, el("div", {
+    style: xs.label
+  }, "Add a client"), el("div", {
+    style: {
+      display: "flex",
+      gap: 6
+    }
+  }, el("input", {
+    value: nm,
+    onChange: e => setNm(e.target.value),
+    placeholder: "Name",
+    style: {
+      ...aStyles.textInput,
+      flex: 1.2,
+      minWidth: 0
+    }
+  }), el("input", {
+    value: ph,
+    onChange: e => setPh(formatPhone(e.target.value)),
+    inputMode: "tel",
+    placeholder: "(555) 123-4567",
+    style: {
+      ...aStyles.textInput,
+      flex: 1,
+      minWidth: 0
+    }
+  }), el("button", {
+    style: aStyles.primaryButtonSmall,
+    onClick: addClient
+  }, "Add")), addNote && el("div", {
+    style: {
+      fontSize: 11.5,
+      color: "#B5443C"
+    }
+  }, addNote), el("button", {
+    style: {
+      ...aStyles.ghostButtonSmall,
+      alignSelf: "flex-start"
+    },
+    onClick: () => setPasteOpen(!pasteOpen)
+  }, pasteOpen ? "Hide paste box" : "Paste a whole list at once"), pasteOpen && el("div", {
+    style: {
+      display: "flex",
+      flexDirection: "column",
+      gap: 8
+    }
+  }, el("p", {
+    style: aStyles.helperNote
+  }, "One person per line, name and number in any order, like: Jane Smith 555-123-4567"), el("textarea", {
+    value: paste,
+    onChange: e => setPaste(e.target.value),
+    style: xs.textarea,
+    placeholder: "Jane Smith 555-123-4567"
+  }), el("div", {
+    style: {
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "space-between",
+      gap: 8
+    }
+  }, el("span", {
+    style: {
+      fontSize: 11.5,
+      color: "#7A716F"
+    }
+  }, pasteNote), el("button", {
+    style: aStyles.primaryButtonSmall,
+    onClick: importPaste
+  }, "Add these"))))), queue && el("div", {
+    style: aStyles.modalBackdrop,
+    onClick: () => setQueue(null)
+  }, el("div", {
+    style: aStyles.modalCard,
+    onClick: e => e.stopPropagation()
+  }, el("button", {
+    style: aStyles.modalClose,
+    onClick: () => setQueue(null),
+    "aria-label": "Close"
+  }, el(X, {
+    size: 16,
+    color: "#7A716F"
+  })), cur ? el(React.Fragment, null, el("div", {
+    style: xs.label
+  }, "Text ", queue.idx + 1, " of ", queue.ids.length), el("h3", {
+    style: aStyles.modalHeading
+  }, cur.name), el("div", {
+    style: aStyles.slotRowSub
+  }, cur.phone), el("div", {
+    style: {
+      ...aStyles.noteBox,
+      whiteSpace: "pre-wrap"
+    }
+  }, el("div", {
+    style: aStyles.noteBoxText
+  }, personalize(message, cur))), el("button", {
+    style: {
+      ...aStyles.primaryButtonSmall,
+      width: "100%",
+      padding: "13px 14px",
+      fontSize: 14,
+      marginTop: 14
+    },
+    onClick: openText
+  }, "Open text to ", firstNameOf(cur)), el("p", {
+    style: {
+      ...aStyles.helperNote,
+      marginTop: 8
+    }
+  }, "Tap Send in Messages, then come back here. It moves to the next person on its own."), el("div", {
+    style: {
+      display: "flex",
+      gap: 8,
+      justifyContent: "space-between",
+      marginTop: 10
+    }
+  }, el("button", {
+    style: aStyles.ghostButtonSmall,
+    onClick: () => step(-1),
+    disabled: queue.idx === 0
+  }, "Back"), el("button", {
+    style: aStyles.ghostButtonSmall,
+    onClick: () => step(1)
+  }, "Skip →"))) : el(React.Fragment, null, el("h3", {
+    style: aStyles.modalHeading
+  }, "That's everyone"), el("p", {
+    style: aStyles.slotRowSub
+  }, queue.ids.length, " texts opened."), el("div", {
+    style: {
+      display: "flex",
+      gap: 8,
+      marginTop: 14
+    }
+  }, el("button", {
+    style: aStyles.ghostButtonSmall,
+    onClick: () => step(-1)
+  }, "Back"), el("button", {
+    style: aStyles.primaryButtonSmall,
+    onClick: () => setQueue(null)
+  }, "Done"))))));
+}
+
+// ---- Client: "News from Sierra" board with an unread number ----
+function NewsBoard({
+  items
+}) {
+  const [open, setOpen] = useState(false);
+  const [fresh, setFresh] = useState([]);
+  const [seen, setSeen] = useState(() => {
+    try {
+      return JSON.parse(localStorage.getItem("ss_seen") || "[]");
+    } catch (e) {
+      return [];
+    }
+  });
+  const unseen = items.filter(a => !seen.includes(a.id));
+  useEffect(() => {
+    const n = unseen.length;
+    try {
+      document.title = (n ? `(${n}) ` : "") + BASE_TITLE;
+    } catch (e) {}
+    try {
+      if (navigator.setAppBadge) {
+        if (n) navigator.setAppBadge(n);else navigator.clearAppBadge();
+      }
+    } catch (e) {}
+  }, [unseen.length]);
+  const toggle = () => {
+    const next = !open;
+    setOpen(next);
+    if (next) {
+      setFresh(unseen.map(a => a.id));
+      const ids = Array.from(new Set([...seen, ...items.map(a => a.id)]));
+      setSeen(ids);
+      try {
+        localStorage.setItem("ss_seen", JSON.stringify(ids.slice(-200)));
+      } catch (e) {}
+    }
+  };
+  const latest = unseen[0];
+  return el("div", {
+    style: {
+      marginBottom: 18
+    }
+  }, el("button", {
+    onClick: toggle,
+    style: {
+      width: "100%",
+      display: "flex",
+      alignItems: "center",
+      gap: 10,
+      textAlign: "left",
+      background: unseen.length ? "#F7ECEA" : "#FFFFFF",
+      border: `1px solid ${unseen.length ? "#E9C7C3" : "#E8DFDA"}`,
+      borderRadius: 12,
+      padding: "11px 14px",
+      cursor: "pointer",
+      color: "#241F21",
+      fontFamily: "inherit"
+    },
+    "aria-expanded": open
+  }, el(Bell, {
+    size: 18,
+    color: "#C97B84"
+  }), el("span", {
+    style: {
+      flex: 1,
+      minWidth: 0
+    }
+  }, el("span", {
+    style: {
+      display: "block",
+      fontSize: 13.5,
+      fontWeight: 600
+    }
+  }, "News from Sierra"), !open && latest && el("span", {
+    style: {
+      display: "block",
+      fontSize: 12,
+      color: "#7A716F",
+      whiteSpace: "nowrap",
+      overflow: "hidden",
+      textOverflow: "ellipsis"
+    }
+  }, latest.title || latest.body)), unseen.length > 0 && el("span", {
+    style: xs.badge
+  }, unseen.length), el(open ? ChevronLeft : ChevronRight, {
+    size: 16,
+    color: "#7A716F",
+    style: {
+      transform: open ? "rotate(-90deg)" : "none"
+    }
+  })), open && el("div", {
+    style: {
+      display: "flex",
+      flexDirection: "column",
+      gap: 8,
+      marginTop: 8
+    }
+  }, items.map(a => {
+    const d = a.createdAt ? new Date(a.createdAt) : null;
+    return el("div", {
+      key: a.id,
+      style: {
+        ...xs.card
+      }
+    }, el("div", {
+      style: {
+        display: "flex",
+        alignItems: "center",
+        gap: 8
+      }
+    }, fresh.includes(a.id) && el("span", {
+      style: {
+        ...xs.badge,
+        minWidth: 0,
+        height: 16,
+        fontSize: 9.5,
+        letterSpacing: 0.4
+      }
+    }, "NEW"), el("span", {
+      style: {
+        fontSize: 14,
+        fontWeight: 600,
+        flex: 1
+      }
+    }, a.title || "Update"), d && !isNaN(d) && el("span", {
+      style: {
+        fontSize: 11,
+        color: "#B8ACA6"
+      }
+    }, d.toLocaleDateString("en-US", {
+      month: "short",
+      day: "numeric"
+    }))), a.body && el("div", {
+      style: {
+        fontSize: 13,
+        color: "#4A4244",
+        marginTop: 6,
+        whiteSpace: "pre-wrap",
+        lineHeight: 1.45
+      }
+    }, a.body));
+  })));
+}
+
+// ---- Client: the page the confirmation text links to ----
+function ConfirmPage({
+  token
+}) {
+  const [info, setInfo] = useState(null);
+  const [done, setDone] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+  useEffect(() => {
+    fetch(`/.netlify/functions/confirm?t=${encodeURIComponent(token)}`, {
+      cache: "no-store"
+    }).then(r => r.json()).then(d => {
+      setInfo(d);
+      if (d.answered) setDone(d.answered);
+    }).catch(() => setInfo({
+      error: true
+    }));
+  }, []);
+  const answer = async response => {
+    setBusy(true);
+    setErr("");
+    try {
+      const r = await fetch("/.netlify/functions/confirm", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          t: token,
+          response
+        })
+      });
+      if (!r.ok) throw new Error("bad");
+      setDone(response);
+    } catch (e) {
+      setErr("Couldn't send that. Please try again in a moment.");
+    } finally {
+      setBusy(false);
+    }
+  };
+  const day = info && info.dayKey ? new Date(info.dayKey) : null;
+  const dateStr = day && !isNaN(day) ? day.toLocaleDateString("en-US", {
+    weekday: "long",
+    month: "long",
+    day: "numeric"
+  }) : info && info.dayKey || "";
+  const logo = el("img", {
+    src: LOGO_SRC,
+    alt: "Sierra Style Hair & Lashes",
+    style: {
+      ...cStyles.logoMark,
+      margin: "0 auto 20px"
+    }
+  });
+  let inner;
+  if (!info) inner = el("p", {
+    style: cStyles.confirmSub
+  }, "Loading…");else if (!info.found) inner = el(React.Fragment, null, logo, el("h1", {
+    style: cStyles.confirmHeading
+  }, "Hmm, we can't find that"), el("p", {
+    style: cStyles.confirmNote
+  }, info.error ? "Couldn't reach Sierra right now. Please try again in a moment." : "This appointment link isn't working. Please text Sierra directly."));else if (done === "confirm") inner = el(React.Fragment, null, logo, el("div", {
+    style: cStyles.confirmCheck
+  }, el(Check, {
+    size: 28,
+    color: "#FAF6F2",
+    strokeWidth: 2.5
+  })), el("h1", {
+    style: cStyles.confirmHeading
+  }, "You're confirmed"), el("p", {
+    style: cStyles.confirmDate
+  }, dateStr), el("p", {
+    style: cStyles.confirmSub
+  }, formatTime(info.start), " – ", formatTime(info.end)), el("p", {
+    style: cStyles.confirmNote
+  }, "See you then!"), el("button", {
+    style: {
+      ...cStyles.ghostButton,
+      marginTop: 20
+    },
+    onClick: () => answer("change"),
+    disabled: busy
+  }, "Actually, I need a different time"));else if (done === "change") inner = el(React.Fragment, null, logo, el("h1", {
+    style: cStyles.confirmHeading
+  }, "Got it"), el("p", {
+    style: cStyles.confirmNote
+  }, "Sierra will text you to find a new time."), el("button", {
+    style: {
+      ...cStyles.ghostButton,
+      marginTop: 20
+    },
+    onClick: () => answer("confirm"),
+    disabled: busy
+  }, "Actually, I can make it"));else inner = el(React.Fragment, null, logo, el("h1", {
+    style: cStyles.confirmHeading
+  }, info.firstName ? `Hi ${info.firstName}!` : "Hi!"), el("p", {
+    style: cStyles.confirmSub
+  }, (info.serviceNames || []).join(" + ") || "Your appointment"), el("p", {
+    style: cStyles.confirmDate
+  }, dateStr), el("p", {
+    style: cStyles.confirmSub
+  }, formatTime(info.start), " – ", formatTime(info.end)), el("div", {
+    style: {
+      display: "flex",
+      flexDirection: "column",
+      gap: 10,
+      marginTop: 22
+    }
+  }, el("button", {
+    style: cStyles.primaryButton,
+    onClick: () => answer("confirm"),
+    disabled: busy
+  }, "Yes, I'll be there"), el("button", {
+    style: cStyles.ghostButton,
+    onClick: () => answer("change"),
+    disabled: busy
+  }, "I need a different time")), err && el("p", {
+    style: {
+      color: "#B5443C",
+      fontSize: 12.5,
+      marginTop: 10
+    }
+  }, err));
+  return el("div", {
+    style: cStyles.page
+  }, el("div", {
+    style: cStyles.confirmCard
+  }, inner));
+}
+// ===================== end new =====================
+
 function PinGate({
   onUnlock,
   onBack
@@ -3485,6 +4692,17 @@ function App() {
     setPin("");
     setMode("client");
   };
+  const confirmToken = (() => {
+    try {
+      const t = new URLSearchParams(window.location.search).get("c");
+      return t && /^[a-f0-9]{16,64}$/.test(t) ? t : null;
+    } catch (e) {
+      return null;
+    }
+  })();
+  if (confirmToken) return React.createElement(ConfirmPage, {
+    token: confirmToken
+  });
   if (mode === "admin") return React.createElement(React.Fragment, null, React.createElement(AdminAppInner, {
     pin,
     onAuthFail: lock

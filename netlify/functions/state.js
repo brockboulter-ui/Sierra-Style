@@ -17,6 +17,17 @@ const isAdmin = (req) => {
   return given.length > 0 && given === real;
 };
 
+async function withNamedStore(name, fn) {
+  try {
+    return await fn(getStore({ name, consistency: "strong" }));
+  } catch (e) {
+    if (String((e && e.message) || "").includes("uncachedEdgeURL")) {
+      return await fn(getStore(name));
+    }
+    throw e;
+  }
+}
+
 // Read/write with strong consistency when this environment supports it, so a
 // change Sierra saves is what everyone reads next. Falls back if it doesn't.
 async function withStore(fn) {
@@ -28,6 +39,23 @@ async function withStore(fn) {
     }
     throw e;
   }
+}
+
+// Answers clients gave by tapping the link in Sierra's confirmation text.
+async function readConfirmations() {
+  const out = {};
+  try {
+    await withNamedStore("confirmations", async (store) => {
+      const { blobs } = await store.list();
+      for (const b of blobs) {
+        const v = await store.get(b.key, { type: "json" });
+        if (v) out[b.key] = v;
+      }
+    });
+  } catch (e) {
+    /* none yet */
+  }
+  return out;
 }
 
 const str = (v, max) => (typeof v === "string" ? v.slice(0, max) : "");
@@ -47,8 +75,16 @@ function publicView(s) {
   for (const [day, on] of Object.entries(s.releasedDays || {})) {
     if (on) releasedDays[day] = true;
   }
+  // Announcements clients can see: not expired yet, newest first.
+  const todayStr = new Date().toISOString().slice(0, 10);
+  const announcements = (Array.isArray(s.announcements) ? s.announcements : [])
+    .filter((a) => a && (a.title || a.body) && !(a.expires && a.expires < todayStr))
+    .map((a) => ({ id: a.id, title: a.title || "", body: a.body || "", createdAt: a.createdAt || "" }))
+    .sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)))
+    .slice(0, 20);
   return {
     initialized: true,
+    announcements,
     services: (s.services || []).map((x) => ({ id: x.id, name: x.name, price: x.price })),
     hours: s.hours,
     hourOverrides: s.hourOverrides || {},
@@ -67,7 +103,7 @@ export default async (req) => {
 
       const saved = await withStore((store) => store.get(KEY, { type: "json" }));
       if (!saved) return json({ initialized: false, rev: 0 });
-      if (wantsAdmin) return json({ ...saved, initialized: true });
+      if (wantsAdmin) return json({ ...saved, initialized: true, confirmations: await readConfirmations() });
       return json(publicView(saved));
     }
 
@@ -100,13 +136,25 @@ export default async (req) => {
         releasedDays: body.releasedDays,
         itemsByDay: body.itemsByDay,
         clients: body.clients,
+        announcements: [],
         updatedAt: new Date().toISOString(),
       };
 
       const rev = await withStore(async (store) => {
         const prev = await store.get(KEY, { type: "json" });
         const newRev = ((prev && prev.rev) || 0) + 1;
-        await store.setJSON(KEY, { ...next, rev: newRev });
+        // An older copy of the page (opened before this update) doesn't send
+        // announcements — keep what's saved rather than wiping them.
+        const announcements = Array.isArray(body.announcements)
+          ? body.announcements.slice(0, 50).map((a) => ({
+              id: str(a && a.id, 80),
+              title: str(a && a.title, 100),
+              body: str(a && a.body, 1000),
+              createdAt: str(a && a.createdAt, 40),
+              expires: str(a && a.expires, 10),
+            }))
+          : (prev && prev.announcements) || [];
+        await store.setJSON(KEY, { ...next, announcements, rev: newRev });
         return newRev;
       });
       return json({ ok: true, rev });
